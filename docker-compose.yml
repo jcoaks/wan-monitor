@@ -1,0 +1,10 @@
+services:
+  wan-monitor:
+    build: .
+    container_name: wan-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    # The router is on the host's LAN, not inside a docker network, so the
+    # container needs to be able to reach 192.168.0.1 directly.
+    network_mode: bridge
