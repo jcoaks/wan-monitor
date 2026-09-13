@@ -65,6 +65,14 @@ ROUTER_USERNAME = os.environ.get("ROUTER_USERNAME", "admin")
 ROUTER_PASSWORD = os.environ["ROUTER_PASSWORD"]  # required, no default
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "20"))
+
+# Human-friendly names for each WAN interface reported by the router.
+# The router labels are "WAN1", "WAN/LAN2", "WAN/LAN3".
+WAN_LABELS: dict[str, str] = {
+    "WAN1":     "WAN1 NETUNO",
+    "WAN/LAN2": "WAN2 CANTV",
+    "WAN/LAN3": "WAN3 TECSOCA",
+}
 # how many consecutive failed HTTP polls (router unreachable / API broken)
 # before we tell Telegram we can't even reach the router anymore
 UNREACHABLE_ALERT_AFTER = int(os.environ.get("UNREACHABLE_ALERT_AFTER", "3"))
@@ -296,8 +304,13 @@ class InterfaceState:
     state: str  # "up" / "down" / "unknown"
 
 
+def friendly_label(iface: dict) -> str:
+    raw = iface.get("t_label") or iface.get("interface", "?")
+    return WAN_LABELS.get(raw, raw)
+
+
 def format_status_line(iface: dict) -> str:
-    label = iface.get("t_label") or iface.get("interface", "?")
+    label = friendly_label(iface)
     state = iface.get("state", "unknown")
     emoji = "✅" if state == "up" else "🔴"
     return f"{emoji} {label}: {state}"
@@ -338,7 +351,7 @@ def main() -> None:
 
             changes = []
             for iface in interfaces:
-                label = iface.get("t_label") or iface.get("interface", "?")
+                label = friendly_label(iface)
                 state = iface.get("state", "unknown")
                 previous = last_known.get(label)
 
@@ -348,7 +361,7 @@ def main() -> None:
 
             if first_poll:
                 summary = "\n".join(format_status_line(i) for i in interfaces)
-                send_telegram_message(f"🟢 wan-monitor iniciado. Estado actual:\n{summary}")
+                send_telegram_message(f"🟢 Monitor WAN iniciado.\n\nEstado actual:\n{summary}")
                 first_poll = False
             elif changes:
                 lines = []
