@@ -32,6 +32,16 @@ login.js). Key points:
    ``/cgi-bin/luci/;stok=<TOKEN>/admin/online?form=online`` (same
    data={"method":"get"} convention) and returns one entry per WAN
    interface: {"state": "up"/"down", "t_label": "WAN1", "interface": "WAN1", ...}
+
+5. The ER605 only allows ONE active admin session at a time, and a new
+   login silently invalidates whatever session was active before it — the
+   API does not ask for confirmation (the "someone else is logged in"
+   dialog in the web UI is purely client-side decoration; the raw API just
+   kicks). So this script logs in, does its one API call, and immediately
+   logs back out (``/admin/system?form=logout``, data={"method":"logout"})
+   instead of holding the session open between polls — otherwise every
+   time a human logged into the web UI, the next poll would silently log
+   them right back out.
 """
 
 import json
@@ -79,6 +89,14 @@ UNREACHABLE_ALERT_AFTER = int(os.environ.get("UNREACHABLE_ALERT_AFTER", "3"))
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g. "@estadointernetcasa" or a numeric chat id
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# How often we check Telegram for new /pausa /reanudar commands. Kept short
+# and independent of POLL_INTERVAL_SECONDS so a /pausa takes effect almost
+# immediately instead of waiting for the next router poll.
+COMMAND_CHECK_INTERVAL_SECONDS = int(os.environ.get("COMMAND_CHECK_INTERVAL_SECONDS", "5"))
+DEFAULT_PAUSE_MINUTES = int(os.environ.get("DEFAULT_PAUSE_MINUTES", "5"))
+MAX_PAUSE_MINUTES = int(os.environ.get("MAX_PAUSE_MINUTES", "60"))
 
 # Power-outage sentinel: a device with a DHCP-reserved IP that has no
 # battery backup (e.g. the fridge), on the same network as this container's
@@ -232,29 +250,48 @@ class ER605Client:
         self.stok = body["result"]["stok"]
         log.info("Logged in to router, stok=%s...", self.stok[:8])
 
-    def get_wan_status(self) -> list[dict]:
+    def logout(self) -> None:
         """
-        Returns a list like:
-          [{"state": "up", "t_label": "WAN1", "interface": "WAN1", ...}, ...]
-        Re-authenticates once and retries if the session looks expired.
+        Best-effort: release the single admin-session slot the ER605
+        enforces, so a human can log into the web UI without this script's
+        next poll silently kicking them back out. Never raises — if logout
+        itself fails, the session was probably already gone anyway (e.g.
+        someone else's login already replaced it).
         """
         if not self.stok:
-            self.login()
-
-        path = f"/cgi-bin/luci/;stok={self.stok}/admin/online?form=online"
-        body = self._post_authenticated(path, {"method": "get"})
-
-        if body.get("error_code") != "0":
-            # session likely expired -> re-login once and retry
-            log.warning("WAN status call failed (%s), re-authenticating", body.get("error_code"))
+            return
+        path = f"/cgi-bin/luci/;stok={self.stok}/admin/system?form=logout"
+        try:
+            self._post_authenticated(path, {"method": "logout"})
+        except (RouterAuthError, requests.RequestException) as exc:
+            log.debug("Logout call failed (harmless): %s", exc)
+        finally:
             self.stok = None
-            self.login()
+
+    def get_wan_status(self) -> list[dict]:
+        """
+        Logs in, fetches WAN status, and immediately logs back out again —
+        every single call. See the module docstring (point 5) for why:
+        holding the session open between polls means every time a human
+        logs into the web UI, this script's very next poll would silently
+        log them right back out, since the router only allows one active
+        admin session and a fresh login just replaces whatever was there
+        with no confirmation. Logging out right away keeps the window
+        where this script "owns" the session down to a couple of requests
+        every POLL_INTERVAL_SECONDS instead of indefinitely.
+
+        Returns a list like:
+          [{"state": "up", "t_label": "WAN1", "interface": "WAN1", ...}, ...]
+        """
+        self.login()
+        try:
             path = f"/cgi-bin/luci/;stok={self.stok}/admin/online?form=online"
             body = self._post_authenticated(path, {"method": "get"})
             if body.get("error_code") != "0":
-                raise RouterAuthError(f"WAN status call failed twice: {body}")
-
-        return body["result"]
+                raise RouterAuthError(f"WAN status call failed: {body}")
+            return body["result"]
+        finally:
+            self.logout()
 
 
 # --------------------------------------------------------------------------
@@ -281,7 +318,7 @@ def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
 # --------------------------------------------------------------------------
 
 def send_telegram_message(text: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"{TELEGRAM_API_BASE}/sendMessage"
     try:
         resp = requests.post(
             url,
@@ -292,6 +329,97 @@ def send_telegram_message(text: str) -> None:
             log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
     except requests.RequestException as exc:
         log.error("Telegram send raised an exception: %s", exc)
+
+
+def get_telegram_updates(offset: Optional[int]) -> list[dict]:
+    """Long-poll-free fetch of new updates (timeout=0: return immediately)."""
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        resp = requests.get(f"{TELEGRAM_API_BASE}/getUpdates", params=params, timeout=10)
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("ok"):
+            log.warning("getUpdates returned not-ok: %s", body)
+            return []
+        return body.get("result", [])
+    except requests.RequestException as exc:
+        log.warning("getUpdates failed: %s", exc)
+        return []
+
+
+def _chat_matches_target(chat: dict) -> bool:
+    """Only accept commands from the configured channel/chat, not wherever else this bot may end up."""
+    target = TELEGRAM_CHAT_ID.strip()
+    chat_id = chat.get("id")
+    username = chat.get("username")
+    if target.lstrip("-").isdigit():
+        return str(chat_id) == target
+    if target.startswith("@") and username:
+        return f"@{username}".lower() == target.lower()
+    return False
+
+
+def parse_command(text: str) -> Optional[tuple[str, Optional[int]]]:
+    text = (text or "").strip()
+    if not text.startswith("/"):
+        return None
+    parts = text[1:].split("@")[0].split()  # strip a "@botname" suffix Telegram sometimes appends
+    if not parts:
+        return None
+    cmd = parts[0].lower()
+    minutes = None
+    if len(parts) > 1:
+        try:
+            minutes = int(parts[1])
+        except ValueError:
+            minutes = None
+    return cmd, minutes
+
+
+def process_telegram_commands(offset: Optional[int], paused_until: Optional[float]) -> tuple[Optional[int], Optional[float]]:
+    """
+    Checks for new /pausa /reanudar /estado commands sent to the channel and
+    acts on them. Returns the (possibly updated) update-offset and
+    paused_until timestamp for the caller to keep using.
+    """
+    updates = get_telegram_updates(offset)
+    for update in updates:
+        offset = update["update_id"] + 1
+        post = update.get("channel_post") or update.get("message")
+        if not post or "text" not in post or not _chat_matches_target(post.get("chat", {})):
+            continue
+
+        parsed = parse_command(post["text"])
+        if not parsed:
+            continue
+        cmd, minutes = parsed
+
+        if cmd in ("pausa", "pause"):
+            minutes = minutes or DEFAULT_PAUSE_MINUTES
+            minutes = max(1, min(minutes, MAX_PAUSE_MINUTES))
+            paused_until = time.time() + minutes * 60
+            send_telegram_message(
+                f"⏸️ Monitoreo del router pausado {minutes} min — puedes entrar al panel "
+                f"tranquilo. El sensor de luz sigue activo. Usa /reanudar para retomar antes."
+            )
+            log.info("Router polling paused for %s minutes via Telegram command", minutes)
+        elif cmd in ("reanudar", "resume", "continuar"):
+            if paused_until:
+                paused_until = None
+                send_telegram_message("▶️ Monitoreo del router reanudado.")
+                log.info("Router polling resumed via Telegram command")
+            else:
+                send_telegram_message("El monitoreo ya estaba activo (no estaba pausado).")
+        elif cmd in ("estado", "status"):
+            if paused_until:
+                remaining = max(0, int(paused_until - time.time()))
+                send_telegram_message(f"⏸️ Pausado — quedan ~{remaining // 60}m {remaining % 60}s.")
+            else:
+                send_telegram_message("▶️ Monitoreo activo (no pausado).")
+
+    return offset, paused_until
 
 
 # --------------------------------------------------------------------------
@@ -318,9 +446,10 @@ def format_status_line(iface: dict) -> str:
 
 def main() -> None:
     log.info(
-        "Starting wan-monitor for %s (poll every %ss)",
+        "Starting wan-monitor for %s (poll every %ss, commands checked every %ss)",
         BASE_URL,
         POLL_INTERVAL_SECONDS,
+        COMMAND_CHECK_INTERVAL_SECONDS,
     )
 
     client = ER605Client(BASE_URL, ROUTER_USERNAME, ROUTER_PASSWORD)
@@ -340,58 +469,94 @@ def main() -> None:
             f" mac={POWER_SENTINEL_MAC}" if POWER_SENTINEL_MAC else "",
         )
 
+    # /pausa /reanudar /estado support. paused_until is a time.time()
+    # deadline, or None when not paused. telegram_offset tracks which
+    # updates we've already seen; primed once at startup so we don't act
+    # on old messages sent before this container started.
+    paused_until: Optional[float] = None
+    backlog = get_telegram_updates(None)
+    telegram_offset = (backlog[-1]["update_id"] + 1) if backlog else None
+    send_telegram_message(
+        "ℹ️ Comandos disponibles: /pausa [minutos] (default "
+        f"{DEFAULT_PAUSE_MINUTES}, máx {MAX_PAUSE_MINUTES}), /reanudar, /estado — "
+        "para pausar el chequeo del router mientras entras al panel web."
+    )
+
+    last_router_check = 0.0
+    last_power_check = 0.0
+
     while True:
-        try:
-            interfaces = client.get_wan_status()
-            consecutive_failures = 0
+        loop_start = time.time()
 
-            if unreachable_alert_sent:
-                send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.")
-                unreachable_alert_sent = False
+        telegram_offset, paused_until = process_telegram_commands(telegram_offset, paused_until)
 
-            changes = []
-            for iface in interfaces:
-                label = friendly_label(iface)
-                state = iface.get("state", "unknown")
-                previous = last_known.get(label)
+        if paused_until and loop_start >= paused_until:
+            paused_until = None
+            send_telegram_message("▶️ Se cumplió el tiempo de pausa — reanudando monitoreo del router.")
 
-                if previous is not None and previous != state:
-                    changes.append((label, previous, state))
-                last_known[label] = state
+        router_check_due = (loop_start - last_router_check) >= POLL_INTERVAL_SECONDS
 
-            if first_poll:
-                summary = "\n".join(format_status_line(i) for i in interfaces)
-                send_telegram_message(f"🟢 Monitor WAN iniciado.\n\nEstado actual:\n{summary}")
-                first_poll = False
-            elif changes:
-                lines = []
-                for label, previous, state in changes:
-                    if state == "up":
-                        lines.append(f"✅ {label} volvió a estar ONLINE")
-                    else:
-                        lines.append(f"🔴 {label} se CAYÓ")
-                send_telegram_message("\n".join(lines))
-                for label, previous, state in changes:
-                    log.info("%s: %s -> %s", label, previous, state)
+        if router_check_due and paused_until:
+            log.debug("Router check due but paused until %s — skipping", paused_until)
+            last_router_check = loop_start
 
-        except RouterAuthError as exc:
-            log.error("Auth/API error talking to router: %s", exc)
-            consecutive_failures += 1
-        except requests.RequestException as exc:
-            log.error("Network error talking to router: %s", exc)
-            consecutive_failures += 1
+        elif router_check_due:
+            last_router_check = loop_start
+            try:
+                interfaces = client.get_wan_status()
+                consecutive_failures = 0
 
-        if consecutive_failures == UNREACHABLE_ALERT_AFTER and not unreachable_alert_sent:
-            send_telegram_message(
-                f"⚠️ No se puede contactar al router ({ROUTER_HOST}) desde hace "
-                f"{UNREACHABLE_ALERT_AFTER * POLL_INTERVAL_SECONDS}s. "
-                f"Puede ser el router, la red local, o el propio script."
-            )
-            unreachable_alert_sent = True
+                if unreachable_alert_sent:
+                    send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.")
+                    unreachable_alert_sent = False
 
-        # Power-outage sentinel: independent of the WAN check above, so it
-        # keeps working even if the router itself is having a bad moment.
-        if POWER_SENTINEL_IP:
+                changes = []
+                for iface in interfaces:
+                    label = friendly_label(iface)
+                    state = iface.get("state", "unknown")
+                    previous = last_known.get(label)
+
+                    if previous is not None and previous != state:
+                        changes.append((label, previous, state))
+                    last_known[label] = state
+
+                if first_poll:
+                    summary = "\n".join(format_status_line(i) for i in interfaces)
+                    send_telegram_message(f"🟢 Monitor WAN iniciado.\n\nEstado actual:\n{summary}")
+                    first_poll = False
+                elif changes:
+                    lines = []
+                    for label, previous, state in changes:
+                        if state == "up":
+                            lines.append(f"✅ {label} volvió a estar ONLINE")
+                        else:
+                            lines.append(f"🔴 {label} se CAYÓ")
+                    send_telegram_message("\n".join(lines))
+                    for label, previous, state in changes:
+                        log.info("%s: %s -> %s", label, previous, state)
+
+            except RouterAuthError as exc:
+                log.error("Auth/API error talking to router: %s", exc)
+                consecutive_failures += 1
+            except requests.RequestException as exc:
+                log.error("Network error talking to router: %s", exc)
+                consecutive_failures += 1
+
+            if consecutive_failures == UNREACHABLE_ALERT_AFTER and not unreachable_alert_sent:
+                send_telegram_message(
+                    f"⚠️ No se puede contactar al router ({ROUTER_HOST}) desde hace "
+                    f"{UNREACHABLE_ALERT_AFTER * POLL_INTERVAL_SECONDS}s. "
+                    f"Puede ser el router, la red local, o el propio script."
+                )
+                unreachable_alert_sent = True
+
+        # Power-outage sentinel: on its own schedule, independent of both the
+        # WAN check above AND of /pausa — /pausa only pauses talking to the
+        # router (that's what causes the session-kick problem), and losing
+        # power-outage detection just because you're browsing the router UI
+        # would defeat the point of having it.
+        if POWER_SENTINEL_IP and (loop_start - last_power_check) >= POLL_INTERVAL_SECONDS:
+            last_power_check = loop_start
             currently_ok = ping_host(POWER_SENTINEL_IP)
 
             if power_first_poll:
@@ -407,7 +572,7 @@ def main() -> None:
 
             power_ok = currently_ok
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(COMMAND_CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
