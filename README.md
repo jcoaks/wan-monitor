@@ -27,6 +27,15 @@ también como comentarios en el código):
    consultado justo antes de loguearse) como protección anti-replay. Sin
    este sufijo el login falla con `error_code: 700` aunque el password sea
    correcto.
+4. El ER605 solo permite **una sesión de administrador activa a la vez**, y
+   un login nuevo mata la anterior sin pedir confirmación (el cartel de
+   "alguien más está conectado" del panel web es solo decoración del
+   lado del cliente — la API cruda no la exige). Por eso el script se
+   loguea, hace su única consulta, y se desloguea de inmediato
+   (`/admin/system?form=logout`) en cada ciclo, en vez de mantener la
+   sesión abierta — si no, cada vez que tú entraras al panel, el
+   siguiente poll del bot (máx `POLL_INTERVAL_SECONDS`) te sacaría sin
+   avisar.
 
 Todo ese flujo (pedir la clave pública, pedir el uptime, cifrar, loguearse,
 y luego consultar `/admin/online?form=online`) está reimplementado en
@@ -68,6 +77,23 @@ alguna (no en cada poll). También avisa si deja de poder contactar al router.
 
 Al iniciar manda un mensaje con el estado actual de las 3 WAN, y desde ahí
 solo avisa ante cambios.
+
+## Pausar el monitoreo para entrar al panel del router
+
+Como el ER605 solo permite una sesión de administrador a la vez y mata la
+anterior sin avisar (ver la sección de arriba), si necesitas entrar tú al
+panel web conviene pausar el bot primero. Mándale al canal, directo como
+mensaje:
+
+- `/pausa` — pausa el monitoreo del router 5 minutos (default)
+- `/pausa 15` — pausa 15 minutos (máximo 60)
+- `/reanudar` — reanuda antes de que se cumpla el tiempo
+- `/estado` — te dice si está pausado y cuánto le queda
+
+La pausa **solo afecta el chequeo de WAN** (que es lo que pelea por la
+sesión) — el sensor de luz sigue funcionando igual mientras estás en el
+panel. El bot revisa comandos nuevos cada `COMMAND_CHECK_INTERVAL_SECONDS`
+(5s por defecto), así que la pausa entra en efecto casi al instante.
 
 ## Sensor de luz (opcional)
 
