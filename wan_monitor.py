@@ -73,6 +73,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g. "@estadointernetcasa" 
 
 BASE_URL = f"{ROUTER_SCHEME}://{ROUTER_HOST}"
 LOGIN_PATH = "/cgi-bin/luci/;stok=/login?form=login"
+LOCALE_PATH = "/cgi-bin/luci/;stok=/locale?form=lang"
 
 REQUEST_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -164,9 +165,39 @@ class ER605Client:
         modulus_hex, exponent_hex = body["result"]["password"]
         return modulus_hex, exponent_hex
 
+    def _fetch_uptime(self) -> int:
+        """
+        The login page calls this ("u()" in login.js) right before encrypting
+        the password every single time. It uses a *different* wire format
+        than the login endpoint: plain ``operation=read`` form data, not the
+        ``data={json}`` wrapper.
+        """
+        resp = self.session.post(
+            self.base_url + LOCALE_PATH,
+            data={"operation": "read"},
+            headers=REQUEST_HEADERS,
+            timeout=10,
+            verify=False,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("error_code") != "0":
+            raise RouterAuthError(f"failed to fetch router uptime: {body}")
+        return int(body["result"]["uptime"])
+
     def login(self) -> None:
         modulus_hex, exponent_hex = self._fetch_public_key()
-        encrypted_password = rsa_encrypt_password(self.password, modulus_hex, exponent_hex)
+        uptime = self._fetch_uptime()
+
+        # This is the piece that isn't visible anywhere in encrypt.js itself:
+        # the password widget (chunk-common.js, password plugin's
+        # "doEncrypt") appends "_<router uptime in seconds>" to the plaintext
+        # before RSA-encrypting it, whenever withTimestamp=true (which it is
+        # for the login form). Without this suffix the router accepts the
+        # request but rejects the login with error_code 700, even though the
+        # credentials and the RSA math are both correct.
+        plaintext = f"{self.password}_{uptime}"
+        encrypted_password = rsa_encrypt_password(plaintext, modulus_hex, exponent_hex)
 
         body = self._post_login_endpoint(
             {
