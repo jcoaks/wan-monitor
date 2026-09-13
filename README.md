@@ -4,9 +4,6 @@ Monitorea el estado real de las 3 WAN del TP-Link Omada ER605 (consultando
 directamente su API interna, no haciendo ping desde afuera) y avisa por
 Telegram cuando una se cae o vuelve.
 
-Proyecto totalmente independiente de `starr-server`: bot de Telegram propio,
-canal propio, contenedor propio.
-
 ## Cómo funciona
 
 El ER605 no expone su estado de WAN por SNMP ni nada estándar: hay que

@@ -78,6 +78,11 @@ REQUEST_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-Requested-With": "XMLHttpRequest",
     "Accept": "application/json, text/javascript, */*; q=0.01",
+    # The router's cgi-bin/luci endpoints do a Referer/Origin check as a CSRF
+    # guard. Without these, it responds with a generic HTTP 404 instead of
+    # ever reaching the application handler (confirmed by testing).
+    "Referer": f"{BASE_URL}/webpages/login.html",
+    "Origin": BASE_URL,
 }
 
 
