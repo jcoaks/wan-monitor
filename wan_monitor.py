@@ -298,6 +298,18 @@ class ER605Client:
 # Power-outage sentinel (ping)
 # --------------------------------------------------------------------------
 
+def format_duration(seconds: float) -> str:
+    """Compact human-readable duration, e.g. '2h 5m', '5m 30s', '12s'."""
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
     """True if `ip` answers a single ICMP echo request within timeout_seconds."""
     try:
@@ -455,11 +467,14 @@ def main() -> None:
     client = ER605Client(BASE_URL, ROUTER_USERNAME, ROUTER_PASSWORD)
 
     last_known: dict[str, str] = {}
+    down_since: dict[str, float] = {}  # label -> loop_start when it went "down"
     consecutive_failures = 0
     unreachable_alert_sent = False
+    first_failure_at: Optional[float] = None
     first_poll = True
 
     power_ok: Optional[bool] = None  # None = not checked yet
+    power_down_since: Optional[float] = None
     power_first_poll = True
     if POWER_SENTINEL_IP:
         log.info(
@@ -507,8 +522,16 @@ def main() -> None:
                 consecutive_failures = 0
 
                 if unreachable_alert_sent:
-                    send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.")
+                    if first_failure_at is not None:
+                        send_telegram_message(
+                            f"✅ El router vuelve a responder (estuvo sin contacto "
+                            f"{format_duration(loop_start - first_failure_at)}). "
+                            f"Reanudando monitoreo de WAN."
+                        )
+                    else:
+                        send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.")
                     unreachable_alert_sent = False
+                first_failure_at = None
 
                 changes = []
                 for iface in interfaces:
@@ -518,6 +541,8 @@ def main() -> None:
 
                     if previous is not None and previous != state:
                         changes.append((label, previous, state))
+                        if state == "down":
+                            down_since[label] = loop_start
                     last_known[label] = state
 
                 if first_poll:
@@ -528,7 +553,14 @@ def main() -> None:
                     lines = []
                     for label, previous, state in changes:
                         if state == "up":
-                            lines.append(f"✅ {label} volvió a estar ONLINE")
+                            since = down_since.pop(label, None)
+                            if since is not None:
+                                lines.append(
+                                    f"✅ {label} volvió a estar ONLINE "
+                                    f"(estuvo caído {format_duration(loop_start - since)})"
+                                )
+                            else:
+                                lines.append(f"✅ {label} volvió a estar ONLINE")
                         else:
                             lines.append(f"🔴 {label} se CAYÓ")
                     send_telegram_message("\n".join(lines))
@@ -538,9 +570,13 @@ def main() -> None:
             except RouterAuthError as exc:
                 log.error("Auth/API error talking to router: %s", exc)
                 consecutive_failures += 1
+                if first_failure_at is None:
+                    first_failure_at = loop_start
             except requests.RequestException as exc:
                 log.error("Network error talking to router: %s", exc)
                 consecutive_failures += 1
+                if first_failure_at is None:
+                    first_failure_at = loop_start
 
             if consecutive_failures == UNREACHABLE_ALERT_AFTER and not unreachable_alert_sent:
                 send_telegram_message(
@@ -563,11 +599,21 @@ def main() -> None:
                 status = "con luz ✅" if currently_ok else "SIN responder 🔴 (revisa si hay luz)"
                 send_telegram_message(f"🔌 Sensor de luz ({POWER_SENTINEL_LABEL}) iniciado: {status}")
                 power_first_poll = False
+                if not currently_ok:
+                    power_down_since = loop_start
             elif power_ok is not None and currently_ok != power_ok:
                 if currently_ok:
-                    send_telegram_message(f"💡 Volvió la luz ({POWER_SENTINEL_LABEL} responde de nuevo)")
+                    if power_down_since is not None:
+                        send_telegram_message(
+                            f"💡 Volvió la luz ({POWER_SENTINEL_LABEL} responde de nuevo, "
+                            f"estuvo sin luz {format_duration(loop_start - power_down_since)})"
+                        )
+                    else:
+                        send_telegram_message(f"💡 Volvió la luz ({POWER_SENTINEL_LABEL} responde de nuevo)")
+                    power_down_since = None
                 else:
                     send_telegram_message(f"🔌 Se fue la luz ({POWER_SENTINEL_LABEL} dejó de responder)")
+                    power_down_since = loop_start
                 log.info("power sentinel: %s -> %s", power_ok, currently_ok)
 
             power_ok = currently_ok
