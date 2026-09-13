@@ -37,6 +37,7 @@ login.js). Key points:
 import json
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -64,20 +65,24 @@ ROUTER_USERNAME = os.environ.get("ROUTER_USERNAME", "admin")
 ROUTER_PASSWORD = os.environ["ROUTER_PASSWORD"]  # required, no default
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "20"))
-
-# Human-friendly names for each WAN interface reported by the router.
-# The router labels are "WAN1", "WAN/LAN2", "WAN/LAN3".
-WAN_LABELS: dict[str, str] = {
-    "WAN1":     "WAN1 NETUNO",
-    "WAN/LAN2": "WAN2 CANTV",
-    "WAN/LAN3": "WAN3 TECSOCA",
-}
 # how many consecutive failed HTTP polls (router unreachable / API broken)
 # before we tell Telegram we can't even reach the router anymore
 UNREACHABLE_ALERT_AFTER = int(os.environ.get("UNREACHABLE_ALERT_AFTER", "3"))
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g. "@estadointernetcasa" or a numeric chat id
+
+# Power-outage sentinel: a device with a DHCP-reserved IP that has no
+# battery backup (e.g. the fridge), on the same network as this container's
+# host. If the host running this container is on a UPS but the sentinel
+# isn't, the sentinel going unreachable is a good proxy for "the power at
+# home went out" (as opposed to just a WiFi/network hiccup, since the
+# router itself is presumably also on the UPS). Optional: leave
+# POWER_SENTINEL_IP unset to disable this check entirely.
+POWER_SENTINEL_IP = os.environ.get("POWER_SENTINEL_IP", "").strip() or None
+POWER_SENTINEL_LABEL = os.environ.get("POWER_SENTINEL_LABEL", "la nevera")
+POWER_SENTINEL_MAC = os.environ.get("POWER_SENTINEL_MAC", "")  # informational only
+PING_TIMEOUT_SECONDS = int(os.environ.get("PING_TIMEOUT_SECONDS", "2"))
 
 BASE_URL = f"{ROUTER_SCHEME}://{ROUTER_HOST}"
 LOGIN_PATH = "/cgi-bin/luci/;stok=/login?form=login"
@@ -245,6 +250,25 @@ class ER605Client:
 
 
 # --------------------------------------------------------------------------
+# Power-outage sentinel (ping)
+# --------------------------------------------------------------------------
+
+def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
+    """True if `ip` answers a single ICMP echo request within timeout_seconds."""
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout_seconds), ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds + 2,
+        )
+        return result.returncode == 0
+    except Exception as exc:  # noqa: BLE001 - ping shelling out can fail in many ways
+        log.warning("ping to %s raised an exception: %s", ip, exc)
+        return False
+
+
+# --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
 
@@ -272,13 +296,8 @@ class InterfaceState:
     state: str  # "up" / "down" / "unknown"
 
 
-def friendly_label(iface: dict) -> str:
-    raw = iface.get("t_label") or iface.get("interface", "?")
-    return WAN_LABELS.get(raw, raw)
-
-
 def format_status_line(iface: dict) -> str:
-    label = friendly_label(iface)
+    label = iface.get("t_label") or iface.get("interface", "?")
     state = iface.get("state", "unknown")
     emoji = "✅" if state == "up" else "🔴"
     return f"{emoji} {label}: {state}"
@@ -298,6 +317,16 @@ def main() -> None:
     unreachable_alert_sent = False
     first_poll = True
 
+    power_ok: Optional[bool] = None  # None = not checked yet
+    power_first_poll = True
+    if POWER_SENTINEL_IP:
+        log.info(
+            "Power-outage sentinel enabled: %s (%s)%s",
+            POWER_SENTINEL_LABEL,
+            POWER_SENTINEL_IP,
+            f" mac={POWER_SENTINEL_MAC}" if POWER_SENTINEL_MAC else "",
+        )
+
     while True:
         try:
             interfaces = client.get_wan_status()
@@ -309,7 +338,7 @@ def main() -> None:
 
             changes = []
             for iface in interfaces:
-                label = friendly_label(iface)
+                label = iface.get("t_label") or iface.get("interface", "?")
                 state = iface.get("state", "unknown")
                 previous = last_known.get(label)
 
@@ -319,15 +348,15 @@ def main() -> None:
 
             if first_poll:
                 summary = "\n".join(format_status_line(i) for i in interfaces)
-                send_telegram_message(f"🟢 Monitor WAN iniciado.\n\nEstado actual:\n{summary}")
+                send_telegram_message(f"🟢 wan-monitor iniciado. Estado actual:\n{summary}")
                 first_poll = False
             elif changes:
                 lines = []
                 for label, previous, state in changes:
                     if state == "up":
-                        lines.append(f"✅ {label} volvió a estar ONLINE (antes: {previous})")
+                        lines.append(f"✅ {label} volvió a estar ONLINE")
                     else:
-                        lines.append(f"🔴 {label} se CAYÓ (antes: {previous})")
+                        lines.append(f"🔴 {label} se CAYÓ")
                 send_telegram_message("\n".join(lines))
                 for label, previous, state in changes:
                     log.info("%s: %s -> %s", label, previous, state)
@@ -346,6 +375,24 @@ def main() -> None:
                 f"Puede ser el router, la red local, o el propio script."
             )
             unreachable_alert_sent = True
+
+        # Power-outage sentinel: independent of the WAN check above, so it
+        # keeps working even if the router itself is having a bad moment.
+        if POWER_SENTINEL_IP:
+            currently_ok = ping_host(POWER_SENTINEL_IP)
+
+            if power_first_poll:
+                status = "con luz ✅" if currently_ok else "SIN responder 🔴 (revisa si hay luz)"
+                send_telegram_message(f"🔌 Sensor de luz ({POWER_SENTINEL_LABEL}) iniciado: {status}")
+                power_first_poll = False
+            elif power_ok is not None and currently_ok != power_ok:
+                if currently_ok:
+                    send_telegram_message(f"💡 Volvió la luz ({POWER_SENTINEL_LABEL} responde de nuevo)")
+                else:
+                    send_telegram_message(f"🔌 Se fue la luz ({POWER_SENTINEL_LABEL} dejó de responder)")
+                log.info("power sentinel: %s -> %s", power_ok, currently_ok)
+
+            power_ok = currently_ok
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
