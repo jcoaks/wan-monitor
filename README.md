@@ -6,9 +6,6 @@ Telegram cuando una se cae o vuelve. También puede avisar cuando se va y
 vuelve la luz de la casa, usando un dispositivo sin batería (la nevera)
 como sensor.
 
-Proyecto totalmente independiente de `starr-server`: bot de Telegram propio,
-canal propio, contenedor propio.
-
 ## Cómo funciona
 
 El ER605 no expone su estado de WAN por SNMP ni nada estándar: hay que
