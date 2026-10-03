@@ -98,16 +98,29 @@ COMMAND_CHECK_INTERVAL_SECONDS = int(os.environ.get("COMMAND_CHECK_INTERVAL_SECO
 DEFAULT_PAUSE_MINUTES = int(os.environ.get("DEFAULT_PAUSE_MINUTES", "5"))
 MAX_PAUSE_MINUTES = int(os.environ.get("MAX_PAUSE_MINUTES", "60"))
 
-# Power-outage sentinel: a device with a DHCP-reserved IP that has no
-# battery backup (e.g. the fridge), on the same network as this container's
-# host. If the host running this container is on a UPS but the sentinel
-# isn't, the sentinel going unreachable is a good proxy for "the power at
-# home went out" (as opposed to just a WiFi/network hiccup, since the
-# router itself is presumably also on the UPS). Optional: leave
-# POWER_SENTINEL_IP unset to disable this check entirely.
+# Power-outage sentinel(s): one or two devices with DHCP-reserved IPs and no
+# battery backup (e.g. the fridge, a smart plug), on the same network as
+# this container's host. If the host running this container is on a UPS but
+# the sentinels aren't, a sentinel going unreachable is a good proxy for
+# "the power at home went out" (as opposed to just a WiFi/network hiccup,
+# since the router itself is presumably also on the UPS).
+#
+# With a SECOND sentinel configured, an outage is only declared once BOTH
+# devices stop responding — a single device dropping off WiFi (e.g. a
+# fridge with a flaky WiFi chip) no longer triggers a false "se fue la luz"
+# alert on its own. With only one sentinel configured, behavior is
+# unchanged from before: that single device going down is the outage.
+#
+# Leave POWER_SENTINEL_IP unset to disable sentinel checking entirely.
+# Leave POWER_SENTINEL2_IP unset to use just the one sentinel (old behavior).
 POWER_SENTINEL_IP = os.environ.get("POWER_SENTINEL_IP", "").strip() or None
 POWER_SENTINEL_LABEL = os.environ.get("POWER_SENTINEL_LABEL", "la nevera")
 POWER_SENTINEL_MAC = os.environ.get("POWER_SENTINEL_MAC", "")  # informational only
+
+POWER_SENTINEL2_IP = os.environ.get("POWER_SENTINEL2_IP", "").strip() or None
+POWER_SENTINEL2_LABEL = os.environ.get("POWER_SENTINEL2_LABEL", "el smart plug")
+POWER_SENTINEL2_MAC = os.environ.get("POWER_SENTINEL2_MAC", "")  # informational only
+
 PING_TIMEOUT_SECONDS = int(os.environ.get("PING_TIMEOUT_SECONDS", "2"))
 
 BASE_URL = f"{ROUTER_SCHEME}://{ROUTER_HOST}"
@@ -473,16 +486,25 @@ def main() -> None:
     first_failure_at: Optional[float] = None
     first_poll = True
 
-    power_ok: Optional[bool] = None  # None = not checked yet
+    power_sentinels: list[dict[str, str]] = []
+    if POWER_SENTINEL_IP:
+        power_sentinels.append({"ip": POWER_SENTINEL_IP, "label": POWER_SENTINEL_LABEL, "mac": POWER_SENTINEL_MAC})
+    if POWER_SENTINEL2_IP:
+        power_sentinels.append({"ip": POWER_SENTINEL2_IP, "label": POWER_SENTINEL2_LABEL, "mac": POWER_SENTINEL2_MAC})
+
+    power_all_down: Optional[bool] = None  # None = not checked yet
+    power_last_state: dict[str, bool] = {}  # label -> last known reachability (debug logging only)
     power_down_since: Optional[float] = None
     power_first_poll = True
-    if POWER_SENTINEL_IP:
+    for sentinel in power_sentinels:
         log.info(
             "Power-outage sentinel enabled: %s (%s)%s",
-            POWER_SENTINEL_LABEL,
-            POWER_SENTINEL_IP,
-            f" mac={POWER_SENTINEL_MAC}" if POWER_SENTINEL_MAC else "",
+            sentinel["label"],
+            sentinel["ip"],
+            f" mac={sentinel['mac']}" if sentinel["mac"] else "",
         )
+    if len(power_sentinels) >= 2:
+        log.info("2+ sentinels configured — outage only declared when ALL of them stop responding.")
 
     # /pausa /reanudar /estado support. paused_until is a time.time()
     # deadline, or None when not paused. telegram_offset tracks which
@@ -591,32 +613,48 @@ def main() -> None:
         # router (that's what causes the session-kick problem), and losing
         # power-outage detection just because you're browsing the router UI
         # would defeat the point of having it.
-        if POWER_SENTINEL_IP and (loop_start - last_power_check) >= POLL_INTERVAL_SECONDS:
+        if power_sentinels and (loop_start - last_power_check) >= POLL_INTERVAL_SECONDS:
             last_power_check = loop_start
-            currently_ok = ping_host(POWER_SENTINEL_IP)
+            results = {s["label"]: ping_host(s["ip"]) for s in power_sentinels}
+            currently_all_down = all(not ok for ok in results.values())
+
+            # Per-device debug logging only (no Telegram alert here) — this is
+            # what lets one sentinel's WiFi hiccup show up in the logs without
+            # bothering you on Telegram; only the combined state below alerts.
+            for label, ok in results.items():
+                prev = power_last_state.get(label)
+                if prev is not None and prev != ok:
+                    log.info("power sentinel %s: %s -> %s", label, prev, ok)
+                power_last_state[label] = ok
 
             if power_first_poll:
-                status = "con luz ✅" if currently_ok else "SIN responder 🔴 (revisa si hay luz)"
-                send_telegram_message(f"🔌 Sensor de luz ({POWER_SENTINEL_LABEL}) iniciado: {status}")
+                lines = [
+                    f"{'con luz ✅' if ok else 'SIN responder 🔴 (revisa si hay luz)'} — {label}"
+                    for label, ok in results.items()
+                ]
+                header = "🔌 Sensor de luz iniciado:" if len(power_sentinels) == 1 else "🔌 Sensores de luz iniciados:"
+                send_telegram_message(header + "\n" + "\n".join(lines))
                 power_first_poll = False
-                if not currently_ok:
+                if currently_all_down:
                     power_down_since = loop_start
-            elif power_ok is not None and currently_ok != power_ok:
-                if currently_ok:
+            elif power_all_down is not None and currently_all_down != power_all_down:
+                if currently_all_down:
+                    who = " y ".join(s["label"] for s in power_sentinels)
+                    send_telegram_message(f"🔌 Se fue la luz ({who} dejaron de responder)")
+                    power_down_since = loop_start
+                else:
+                    which_back = ", ".join(label for label, ok in results.items() if ok)
                     if power_down_since is not None:
                         send_telegram_message(
-                            f"💡 Volvió la luz ({POWER_SENTINEL_LABEL} responde de nuevo, "
+                            f"💡 Volvió la luz ({which_back} responde de nuevo, "
                             f"estuvo sin luz {format_duration(loop_start - power_down_since)})"
                         )
                     else:
-                        send_telegram_message(f"💡 Volvió la luz ({POWER_SENTINEL_LABEL} responde de nuevo)")
+                        send_telegram_message(f"💡 Volvió la luz ({which_back} responde de nuevo)")
                     power_down_since = None
-                else:
-                    send_telegram_message(f"🔌 Se fue la luz ({POWER_SENTINEL_LABEL} dejó de responder)")
-                    power_down_since = loop_start
-                log.info("power sentinel: %s -> %s", power_ok, currently_ok)
+                log.info("power sentinels combined: %s -> %s", power_all_down, currently_all_down)
 
-            power_ok = currently_ok
+            power_all_down = currently_all_down
 
         time.sleep(COMMAND_CHECK_INTERVAL_SECONDS)
 
