@@ -75,6 +75,10 @@ alguna (no en cada poll). También avisa si deja de poder contactar al router.
 Al iniciar manda un mensaje con el estado actual de las 3 WAN, y desde ahí
 solo avisa ante cambios.
 
+Los avisos de WAN y del router llegan **en silencio** (sin sonido ni
+vibración en el teléfono): quedan en el canal para revisarlos cuando
+quieras. Los avisos de luz sí suenan normal.
+
 ## Pausar el monitoreo para entrar al panel del router
 
 Como el ER605 solo permite una sesión de administrador a la vez y mata la

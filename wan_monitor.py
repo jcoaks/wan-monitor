@@ -342,12 +342,17 @@ def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
 # Telegram
 # --------------------------------------------------------------------------
 
-def send_telegram_message(text: str) -> None:
+def send_telegram_message(text: str, silent: bool = False) -> None:
+    """silent=True delivers the message without sound/vibration on the phone
+    (used for WAN/router alerts; power alerts still notify normally)."""
     url = f"{TELEGRAM_API_BASE}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if silent:
+        data["disable_notification"] = "true"
     try:
         resp = requests.post(
             url,
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            data=data,
             timeout=10,
         )
         if resp.status_code != 200:
@@ -548,10 +553,11 @@ def main() -> None:
                         send_telegram_message(
                             f"✅ El router vuelve a responder (estuvo sin contacto "
                             f"{format_duration(loop_start - first_failure_at)}). "
-                            f"Reanudando monitoreo de WAN."
+                            f"Reanudando monitoreo de WAN.",
+                            silent=True,
                         )
                     else:
-                        send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.")
+                        send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.", silent=True)
                     unreachable_alert_sent = False
                 first_failure_at = None
 
@@ -569,7 +575,7 @@ def main() -> None:
 
                 if first_poll:
                     summary = "\n".join(format_status_line(i) for i in interfaces)
-                    send_telegram_message(f"🟢 Monitor WAN iniciado.\n\nEstado actual:\n{summary}")
+                    send_telegram_message(f"🟢 Monitor WAN iniciado.\n\nEstado actual:\n{summary}", silent=True)
                     first_poll = False
                 elif changes:
                     lines = []
@@ -585,7 +591,7 @@ def main() -> None:
                                 lines.append(f"✅ {label} volvió a estar ONLINE")
                         else:
                             lines.append(f"🔴 {label} se CAYÓ")
-                    send_telegram_message("\n".join(lines))
+                    send_telegram_message("\n".join(lines), silent=True)
                     for label, previous, state in changes:
                         log.info("%s: %s -> %s", label, previous, state)
 
@@ -604,7 +610,8 @@ def main() -> None:
                 send_telegram_message(
                     f"⚠️ No se puede contactar al router ({ROUTER_HOST}) desde hace "
                     f"{UNREACHABLE_ALERT_AFTER * POLL_INTERVAL_SECONDS}s. "
-                    f"Puede ser el router, la red local, o el propio script."
+                    f"Puede ser el router, la red local, o el propio script.",
+                    silent=True,
                 )
                 unreachable_alert_sent = True
 
