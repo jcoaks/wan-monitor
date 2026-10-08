@@ -342,9 +342,9 @@ def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
 # Telegram
 # --------------------------------------------------------------------------
 
-def send_telegram_message(text: str, silent: bool = False) -> None:
-    """silent=True delivers the message without sound/vibration on the phone
-    (used for WAN/router alerts; power alerts still notify normally)."""
+def send_telegram_message(text: str, silent: bool = True) -> None:
+    """Silent by default (no sound/vibration on the phone): WAN/router alerts,
+    command replies and status messages. Only power alerts pass silent=False."""
     url = f"{TELEGRAM_API_BASE}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if silent:
@@ -682,24 +682,25 @@ def main() -> None:
                     for label, ok in results.items()
                 ]
                 header = "🔌 Sensor de luz iniciado:" if len(power_sentinels) == 1 else "🔌 Sensores de luz iniciados:"
-                send_telegram_message(header + "\n" + "\n".join(lines))
+                send_telegram_message(header + "\n" + "\n".join(lines), silent=False)
                 power_first_poll = False
                 if currently_all_down:
                     power_down_since = loop_start
             elif power_all_down is not None and currently_all_down != power_all_down:
                 if currently_all_down:
                     who = " y ".join(s["label"] for s in power_sentinels)
-                    send_telegram_message(f"🔌 Se fue la luz ({who} dejaron de responder)")
+                    send_telegram_message(f"🔌 Se fue la luz ({who} dejaron de responder)", silent=False)
                     power_down_since = loop_start
                 else:
                     which_back = ", ".join(label for label, ok in results.items() if ok)
                     if power_down_since is not None:
                         send_telegram_message(
                             f"💡 Volvió la luz ({which_back} responde de nuevo, "
-                            f"estuvo sin luz {format_duration(loop_start - power_down_since)})"
+                            f"estuvo sin luz {format_duration(loop_start - power_down_since)})",
+                            silent=False,
                         )
                     else:
-                        send_telegram_message(f"💡 Volvió la luz ({which_back} responde de nuevo)")
+                        send_telegram_message(f"💡 Volvió la luz ({which_back} responde de nuevo)", silent=False)
                     power_down_since = None
                 log.info("power sentinels combined: %s -> %s", power_all_down, currently_all_down)
 
