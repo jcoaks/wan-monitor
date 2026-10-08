@@ -50,7 +50,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 import urllib3
@@ -408,11 +408,16 @@ def parse_command(text: str) -> Optional[tuple[str, Optional[int]]]:
     return cmd, minutes
 
 
-def process_telegram_commands(offset: Optional[int], paused_until: Optional[float]) -> tuple[Optional[int], Optional[float]]:
+def process_telegram_commands(
+    offset: Optional[int],
+    paused_until: Optional[float],
+    build_status: Callable[[], str],
+) -> tuple[Optional[int], Optional[float]]:
     """
     Checks for new /pausa /reanudar /estado commands sent to the channel and
     acts on them. Returns the (possibly updated) update-offset and
-    paused_until timestamp for the caller to keep using.
+    paused_until timestamp for the caller to keep using. `build_status`
+    returns the full /estado report (pause, WAN and power sentinel state).
     """
     updates = get_telegram_updates(offset)
     for update in updates:
@@ -443,11 +448,7 @@ def process_telegram_commands(offset: Optional[int], paused_until: Optional[floa
             else:
                 send_telegram_message("El monitoreo ya estaba activo (no estaba pausado).")
         elif cmd in ("estado", "status"):
-            if paused_until:
-                remaining = max(0, int(paused_until - time.time()))
-                send_telegram_message(f"⏸️ Pausado — quedan ~{remaining // 60}m {remaining % 60}s.")
-            else:
-                send_telegram_message("▶️ Monitoreo activo (no pausado).")
+            send_telegram_message(build_status(), silent=True)
 
     return offset, paused_until
 
@@ -489,6 +490,7 @@ def main() -> None:
     consecutive_failures = 0
     unreachable_alert_sent = False
     first_failure_at: Optional[float] = None
+    last_wan_ok_at: Optional[float] = None  # when the router last answered a poll
     first_poll = True
 
     power_sentinels: list[dict[str, str]] = []
@@ -527,10 +529,49 @@ def main() -> None:
     last_router_check = 0.0
     last_power_check = 0.0
 
+    def build_status() -> str:
+        """Report for /estado. WAN state comes from the last poll (never
+        logs into the router here — that would kick a human out of the
+        panel); power sentinels are pinged live since that's cheap."""
+        now = time.time()
+        lines = []
+
+        if paused_until:
+            remaining = max(0, int(paused_until - now))
+            lines.append(f"⏸️ Monitoreo del router pausado — quedan ~{remaining // 60}m {remaining % 60}s.")
+        else:
+            lines.append("▶️ Monitoreo activo (no pausado).")
+
+        lines.append("")
+        lines.append("🌐 Conexiones:")
+        if last_known:
+            for label, state in last_known.items():
+                lines.append(f"{'✅' if state == 'up' else '🔴'} {label}: {state}")
+            if last_wan_ok_at is not None:
+                lines.append(f"(último chequeo hace {format_duration(now - last_wan_ok_at)})")
+        else:
+            lines.append("Sin datos todavía (aún no hay un chequeo exitoso).")
+        if unreachable_alert_sent:
+            lines.append("⚠️ El router no responde actualmente — los datos pueden estar desactualizados.")
+
+        if power_sentinels:
+            lines.append("")
+            lines.append("🔌 Sensores de luz:")
+            results = {s["label"]: ping_host(s["ip"]) for s in power_sentinels}
+            for label, ok in results.items():
+                lines.append(f"{'✅ con luz' if ok else '🔴 sin responder'} — {label}")
+            if all(not ok for ok in results.values()):
+                if power_down_since is not None:
+                    lines.append(f"Sin luz desde hace {format_duration(now - power_down_since)}.")
+            elif any(not ok for ok in results.values()):
+                lines.append("Hay luz (al menos un sensor responde).")
+
+        return "\n".join(lines)
+
     while True:
         loop_start = time.time()
 
-        telegram_offset, paused_until = process_telegram_commands(telegram_offset, paused_until)
+        telegram_offset, paused_until = process_telegram_commands(telegram_offset, paused_until, build_status)
 
         if paused_until and loop_start >= paused_until:
             paused_until = None
@@ -547,6 +588,7 @@ def main() -> None:
             try:
                 interfaces = client.get_wan_status()
                 consecutive_failures = 0
+                last_wan_ok_at = loop_start
 
                 if unreachable_alert_sent:
                     if first_failure_at is not None:

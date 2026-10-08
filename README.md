@@ -89,7 +89,7 @@ mensaje:
 - `/pausa` — pausa el monitoreo del router 5 minutos (default)
 - `/pausa 15` — pausa 15 minutos (máximo 60)
 - `/reanudar` — reanuda antes de que se cumpla el tiempo
-- `/estado` — te dice si está pausado y cuánto le queda
+- `/estado` — te dice si está pausado y cuánto le queda, el estado de cada WAN (del último chequeo, sin loguearse al router) y los sensores de luz (ping en vivo)
 
 La pausa **solo afecta el chequeo de WAN** (que es lo que pelea por la
 sesión) — el sensor de luz sigue funcionando igual mientras estás en el
