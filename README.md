@@ -115,6 +115,22 @@ responder"), y desde ahí solo avisa cuando cambia:
 - 🔌 Se fue la luz (el dispositivo dejó de responder)
 - 💡 Volvió la luz (el dispositivo responde de nuevo)
 
+## Avisos con IA (opcional)
+
+Con `ANTHROPIC_API_KEY` en el `.env`, los avisos de eventos (se fue/volvió la
+luz, WAN caída/recuperada, router sin contacto) los redacta Claude en tono
+venezolano, usando datos reales del evento: duración de la caída, cuánto
+tiempo hubo luz antes, cuántos cortes van hoy y la hora local. Debajo del
+texto sale la línea factual de siempre (`AI_KEEP_FACTUAL_LINE=false` la quita).
+
+- Si no hay key, `AI_MESSAGES_ENABLED=false`, la API falla o pasa
+  `AI_TIMEOUT_SECONDS` (12s), se manda el aviso estático de siempre: nunca se
+  pierde una alerta por culpa de la IA.
+- `/estado`, las respuestas a comandos y los mensajes de inicio siguen
+  estáticos. El sonido/silencio de cada aviso no cambia.
+- `AI_MODEL` (default `claude-opus-5-5`) y `AI_EFFORT` (default `low`) se
+  pueden cambiar; la zona horaria sale de `TZ` (default `America/Caracas`).
+
 ## Notas
 
 - `ROUTER_SCHEME=https` usa el certificado autofirmado del router

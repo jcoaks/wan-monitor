@@ -44,14 +44,18 @@ login.js). Key points:
    them right back out.
 """
 
+import html
 import json
 import logging
 import os
 import subprocess
 import time
+from collections import deque
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import anthropic
 import requests
 import urllib3
 
@@ -122,6 +126,23 @@ POWER_SENTINEL2_LABEL = os.environ.get("POWER_SENTINEL2_LABEL", "el smart plug")
 POWER_SENTINEL2_MAC = os.environ.get("POWER_SENTINEL2_MAC", "")  # informational only
 
 PING_TIMEOUT_SECONDS = int(os.environ.get("PING_TIMEOUT_SECONDS", "2"))
+
+# AI-written alerts (optional). When ANTHROPIC_API_KEY is set, event alerts
+# (power out/back, WAN down/up, router unreachable) are rewritten by Claude
+# in a casual Venezuelan tone. If the key is missing, AI_MESSAGES_ENABLED is
+# false, or the API call fails/times out for any reason, the plain static
+# alert text is sent instead — an alert is never lost or delayed for long
+# because of the AI step. /estado, command replies and startup messages are
+# always static.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip() or None
+AI_MESSAGES_ENABLED = os.environ.get("AI_MESSAGES_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+AI_MODEL = os.environ.get("AI_MODEL", "claude-opus-5-5")
+AI_EFFORT = os.environ.get("AI_EFFORT", "low")
+AI_TIMEOUT_SECONDS = float(os.environ.get("AI_TIMEOUT_SECONDS", "12"))
+AI_MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "1024"))
+# Append the plain factual alert under the AI text so the info is never
+# buried behind a joke.
+AI_KEEP_FACTUAL_LINE = os.environ.get("AI_KEEP_FACTUAL_LINE", "true").strip().lower() not in ("0", "false", "no", "off")
 
 BASE_URL = f"{ROUTER_SCHEME}://{ROUTER_HOST}"
 LOGIN_PATH = "/cgi-bin/luci/;stok=/login?form=login"
@@ -339,6 +360,95 @@ def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
 
 
 # --------------------------------------------------------------------------
+# AI-written alerts (Anthropic API)
+# --------------------------------------------------------------------------
+
+AI_SYSTEM_PROMPT = """Eres la voz de un bot de Telegram que avisa a una familia venezolana sobre \
+el internet y la luz de su casa. Recibes un evento con datos reales y escribes el aviso.
+
+Reglas:
+- Español venezolano coloquial y cálido (ej: "chamo", "qué molleja", "ya va", "coño", "vale"), sin \
+exagerar ni sonar caricaturesco. Un toque de humor y de personalidad está bien.
+- Máximo 2 frases cortas (menos de 240 caracteres en total). Un emoji como mucho.
+- Usa SOLO los datos del evento. No inventes cifras, causas, ni duraciones. Si un dato no viene, \
+no lo menciones. Si "es_minimo" es true, la duración es "al menos" ese tiempo.
+- Si hay historial reciente (cortes de hoy, tiempo con luz antes del corte), puedes comentarlo.
+- No repitas ni parafrasees los avisos anteriores listados; varía el arranque y el tono.
+- Texto plano: sin markdown, sin HTML, sin listas, sin comillas alrededor del mensaje.
+- Los avisos de caída son molestos: empatiza. Los de recuperación: alivio. Si es de madrugada, \
+puedes mencionarlo.
+- Responde únicamente con el texto del aviso."""
+
+_recent_ai_messages: deque = deque(maxlen=4)
+_ai_client: Optional[anthropic.Anthropic] = None
+
+
+def _get_ai_client() -> anthropic.Anthropic:
+    global _ai_client
+    if _ai_client is None:
+        # max_retries=0: the main loop is single-threaded, so a slow API must
+        # never stall command polling and router/power checks (and a power
+        # cut can take the internet down too) — fall back to static text.
+        _ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=AI_TIMEOUT_SECONDS, max_retries=0)
+    return _ai_client
+
+
+def ai_enabled() -> bool:
+    return bool(ANTHROPIC_API_KEY) and AI_MESSAGES_ENABLED
+
+
+def compose_alert(kind: str, facts: dict, fallback: str) -> str:
+    """
+    Returns the Telegram HTML text for an event alert. `fallback` is the
+    plain static alert (already HTML-safe); it is returned as-is whenever the
+    AI is disabled or anything goes wrong, and otherwise appended under the
+    AI text when AI_KEEP_FACTUAL_LINE is set.
+    """
+    if not ai_enabled():
+        return fallback
+
+    now = datetime.now()
+    event = {
+        "evento": kind,
+        "hora_local": now.strftime("%H:%M"),
+        "dia_semana": ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"][now.weekday()],
+        **facts,
+    }
+    user_prompt = "Evento:\n" + json.dumps(event, ensure_ascii=False, indent=2)
+    if _recent_ai_messages:
+        user_prompt += "\n\nAvisos anteriores (no repetir):\n" + "\n".join(f"- {m}" for m in _recent_ai_messages)
+
+    try:
+        response = _get_ai_client().messages.create(
+            model=AI_MODEL,
+            max_tokens=AI_MAX_TOKENS,
+            system=AI_SYSTEM_PROMPT,
+            output_config={"effort": AI_EFFORT},
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except anthropic.APIError as exc:  # status, connection and timeout errors
+        log.warning("AI message generation failed (%s): %s — sending static alert", type(exc).__name__, exc)
+        return fallback
+    except Exception as exc:  # noqa: BLE001 - an alert must go out no matter what
+        log.warning("AI message generation raised %s: %s — sending static alert", type(exc).__name__, exc)
+        return fallback
+
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    if response.stop_reason in ("refusal", "max_tokens") or not text:
+        log.warning("AI message unusable (stop_reason=%s, %d chars) — sending static alert", response.stop_reason, len(text))
+        return fallback
+
+    log.info(
+        "AI alert generated (%s, in=%s out=%s tokens, request_id=%s)",
+        kind, response.usage.input_tokens, response.usage.output_tokens, response._request_id,
+    )
+    _recent_ai_messages.append(text)
+    # Telegram parse_mode is HTML: escape whatever the model produced.
+    body = html.escape(text)
+    return f"{body}\n\n{fallback}" if AI_KEEP_FACTUAL_LINE else body
+
+
+# --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
 
@@ -484,6 +594,10 @@ def main() -> None:
     )
 
     client = ER605Client(BASE_URL, ROUTER_USERNAME, ROUTER_PASSWORD)
+    if ai_enabled():
+        log.info("AI-written alerts enabled (model=%s, effort=%s, timeout=%ss)", AI_MODEL, AI_EFFORT, AI_TIMEOUT_SECONDS)
+    else:
+        log.info("AI-written alerts disabled (static alert text) — set ANTHROPIC_API_KEY to enable")
 
     last_known: dict[str, str] = {}
     down_since: dict[str, float] = {}  # label -> loop_start when it went "down"
@@ -491,6 +605,12 @@ def main() -> None:
     unreachable_alert_sent = False
     first_failure_at: Optional[float] = None
     last_wan_ok_at: Optional[float] = None  # when the router last answered a poll
+    # Context for AI-written alerts (counters are per local calendar day)
+    wan_outages_today: dict[str, int] = {}
+    power_outages_today = 0
+    counters_date = datetime.now().date()
+    power_up_since: Optional[float] = None  # when power was last seen up (or monitor start)
+    power_up_since_is_lower_bound = True  # True until we've witnessed an actual restore
     first_poll = True
 
     power_sentinels: list[dict[str, str]] = []
@@ -571,6 +691,11 @@ def main() -> None:
     while True:
         loop_start = time.time()
 
+        if datetime.now().date() != counters_date:
+            counters_date = datetime.now().date()
+            wan_outages_today.clear()
+            power_outages_today = 0
+
         telegram_offset, paused_until = process_telegram_commands(telegram_offset, paused_until, build_status)
 
         if paused_until and loop_start >= paused_until:
@@ -592,14 +717,16 @@ def main() -> None:
 
                 if unreachable_alert_sent:
                     if first_failure_at is not None:
-                        send_telegram_message(
-                            f"✅ El router vuelve a responder (estuvo sin contacto "
-                            f"{format_duration(loop_start - first_failure_at)}). "
-                            f"Reanudando monitoreo de WAN.",
-                            silent=True,
+                        down_for = format_duration(loop_start - first_failure_at)
+                        static = (
+                            f"✅ El router vuelve a responder (estuvo sin contacto {down_for}). "
+                            f"Reanudando monitoreo de WAN."
                         )
+                        facts = {"que_paso": "el monitor volvió a tener contacto con el router", "tiempo_sin_contacto": down_for}
                     else:
-                        send_telegram_message("✅ El router vuelve a responder. Reanudando monitoreo de WAN.", silent=True)
+                        static = "✅ El router vuelve a responder. Reanudando monitoreo de WAN."
+                        facts = {"que_paso": "el monitor volvió a tener contacto con el router"}
+                    send_telegram_message(compose_alert("router_recuperado", facts, static), silent=True)
                     unreachable_alert_sent = False
                 first_failure_at = None
 
@@ -613,6 +740,7 @@ def main() -> None:
                         changes.append((label, previous, state))
                         if state == "down":
                             down_since[label] = loop_start
+                            wan_outages_today[label] = wan_outages_today.get(label, 0) + 1
                     last_known[label] = state
 
                 if first_poll:
@@ -621,19 +749,33 @@ def main() -> None:
                     first_poll = False
                 elif changes:
                     lines = []
+                    ai_changes = []
                     for label, previous, state in changes:
                         if state == "up":
                             since = down_since.pop(label, None)
                             if since is not None:
-                                lines.append(
-                                    f"✅ {label} volvió a estar ONLINE "
-                                    f"(estuvo caído {format_duration(loop_start - since)})"
-                                )
+                                down_for = format_duration(loop_start - since)
+                                lines.append(f"✅ {label} volvió a estar ONLINE (estuvo caído {down_for})")
+                                ai_changes.append({"conexion": label, "ahora": "volvió (online)", "tiempo_caida": down_for})
                             else:
                                 lines.append(f"✅ {label} volvió a estar ONLINE")
+                                ai_changes.append({"conexion": label, "ahora": "volvió (online)"})
                         else:
                             lines.append(f"🔴 {label} se CAYÓ")
-                    send_telegram_message("\n".join(lines), silent=True)
+                            ai_changes.append({
+                                "conexion": label,
+                                "ahora": "se cayó (offline)",
+                                "caidas_hoy": wan_outages_today.get(label, 1),
+                            })
+                    others_up = [l for l, st in last_known.items() if st == "up"]
+                    others_down = [l for l, st in last_known.items() if st != "up"]
+                    facts = {
+                        "cambios": ai_changes,
+                        "conexiones_activas_ahora": others_up,
+                        "conexiones_caidas_ahora": others_down,
+                        "nota": "son 3 salidas de internet de la casa (proveedores distintos); que una caiga no significa que se quedaron sin internet si otras siguen activas",
+                    }
+                    send_telegram_message(compose_alert("cambio_wan", facts, "\n".join(lines)), silent=True)
                     for label, previous, state in changes:
                         log.info("%s: %s -> %s", label, previous, state)
 
@@ -649,12 +791,17 @@ def main() -> None:
                     first_failure_at = loop_start
 
             if consecutive_failures == UNREACHABLE_ALERT_AFTER and not unreachable_alert_sent:
-                send_telegram_message(
+                static = (
                     f"⚠️ No se puede contactar al router ({ROUTER_HOST}) desde hace "
                     f"{UNREACHABLE_ALERT_AFTER * POLL_INTERVAL_SECONDS}s. "
-                    f"Puede ser el router, la red local, o el propio script.",
-                    silent=True,
+                    f"Puede ser el router, la red local, o el propio script."
                 )
+                facts = {
+                    "que_paso": "el monitor no logra contactar al router",
+                    "segundos_sin_contacto": UNREACHABLE_ALERT_AFTER * POLL_INTERVAL_SECONDS,
+                    "posibles_causas": "el router, la red local o el propio monitor (no se sabe cuál)",
+                }
+                send_telegram_message(compose_alert("router_sin_contacto", facts, static), silent=True)
                 unreachable_alert_sent = True
 
         # Power-outage sentinel: on its own schedule, independent of both the
@@ -686,22 +833,40 @@ def main() -> None:
                 power_first_poll = False
                 if currently_all_down:
                     power_down_since = loop_start
+                    power_up_since = None
+                else:
+                    power_up_since = loop_start
             elif power_all_down is not None and currently_all_down != power_all_down:
                 if currently_all_down:
                     who = " y ".join(s["label"] for s in power_sentinels)
-                    send_telegram_message(f"🔌 Se fue la luz ({who} dejaron de responder)", silent=False)
+                    power_outages_today += 1
+                    facts = {
+                        "que_paso": "se fue la luz en la casa (los dispositivos sin batería dejaron de responder)",
+                        "cortes_de_luz_hoy_incluyendo_este": power_outages_today,
+                    }
+                    if power_up_since is not None:
+                        facts["tiempo_con_luz_antes_del_corte"] = format_duration(loop_start - power_up_since)
+                        facts["es_minimo"] = power_up_since_is_lower_bound
+                    static = f"🔌 Se fue la luz ({who} dejaron de responder)"
+                    send_telegram_message(compose_alert("se_fue_la_luz", facts, static), silent=False)
                     power_down_since = loop_start
+                    power_up_since = None
                 else:
                     which_back = ", ".join(label for label, ok in results.items() if ok)
+                    facts = {
+                        "que_paso": "volvió la luz en la casa",
+                        "cortes_de_luz_hoy": power_outages_today,
+                    }
                     if power_down_since is not None:
-                        send_telegram_message(
-                            f"💡 Volvió la luz ({which_back} responde de nuevo, "
-                            f"estuvo sin luz {format_duration(loop_start - power_down_since)})",
-                            silent=False,
-                        )
+                        down_for = format_duration(loop_start - power_down_since)
+                        facts["tiempo_sin_luz"] = down_for
+                        static = f"💡 Volvió la luz ({which_back} responde de nuevo, estuvo sin luz {down_for})"
                     else:
-                        send_telegram_message(f"💡 Volvió la luz ({which_back} responde de nuevo)", silent=False)
+                        static = f"💡 Volvió la luz ({which_back} responde de nuevo)"
+                    send_telegram_message(compose_alert("volvio_la_luz", facts, static), silent=False)
                     power_down_since = None
+                    power_up_since = loop_start
+                    power_up_since_is_lower_bound = False
                 log.info("power sentinels combined: %s -> %s", power_all_down, currently_all_down)
 
             power_all_down = currently_all_down
