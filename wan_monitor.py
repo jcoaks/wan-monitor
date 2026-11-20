@@ -68,6 +68,23 @@ logging.basicConfig(
 log = logging.getLogger("wan-monitor")
 
 
+class _RedactSecrets(logging.Filter):
+    """requests/urllib3 put the full request URL (which contains the Telegram
+    bot token) into their exception messages, and those end up in the logs.
+    Replace any configured secret with a placeholder before it is emitted."""
+
+    def __init__(self, secrets: list[str]):
+        super().__init__()
+        self.secrets = [s for s in secrets if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        for secret in self.secrets:
+            message = message.replace(secret, "<redacted>")
+        record.msg, record.args = message, None
+        return True
+
+
 # --------------------------------------------------------------------------
 # Config (all from environment variables so this drops straight into
 # docker-compose without touching code)
@@ -94,6 +111,11 @@ UNREACHABLE_ALERT_AFTER = int(os.environ.get("UNREACHABLE_ALERT_AFTER", "3"))
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g. "@estadointernetcasa" or a numeric chat id
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# Keep secrets out of the logs (see _RedactSecrets). ANTHROPIC_API_KEY is read
+# below, so look it up here directly.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RedactSecrets([TELEGRAM_BOT_TOKEN, os.environ.get("ANTHROPIC_API_KEY", "").strip(), ROUTER_PASSWORD]))
 
 # How often we check Telegram for new /pausa /reanudar commands. Kept short
 # and independent of POLL_INTERVAL_SECONDS so a /pausa takes effect almost
