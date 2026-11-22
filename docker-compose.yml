@@ -7,7 +7,8 @@ services:
       - .env
     environment:
       # Local timezone, used for the time of day in AI-written alerts.
-      # ANTHROPIC_API_KEY (and the optional AI_* settings) come from .env.
+      # CLAUDE_API_TOKEN (and the optional CLAUDE_API_URL / AI_* settings)
+      # come from .env; Claude is reached through starr-server's claude-api.
       TZ: ${TZ:-America/Caracas}
     # The router is on the host's LAN, not inside a docker network, so the
     # container needs to be able to reach 192.168.0.1 directly.

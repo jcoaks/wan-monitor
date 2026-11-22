@@ -55,7 +55,6 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import anthropic
 import requests
 import urllib3
 
@@ -112,10 +111,10 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g. "@estadointernetcasa" or a numeric chat id
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# Keep secrets out of the logs (see _RedactSecrets). ANTHROPIC_API_KEY is read
+# Keep secrets out of the logs (see _RedactSecrets). CLAUDE_API_TOKEN is read
 # below, so look it up here directly.
 for _handler in logging.getLogger().handlers:
-    _handler.addFilter(_RedactSecrets([TELEGRAM_BOT_TOKEN, os.environ.get("ANTHROPIC_API_KEY", "").strip(), ROUTER_PASSWORD]))
+    _handler.addFilter(_RedactSecrets([TELEGRAM_BOT_TOKEN, os.environ.get("CLAUDE_API_TOKEN", "").strip(), ROUTER_PASSWORD]))
 
 # How often we check Telegram for new /pausa /reanudar commands. Kept short
 # and independent of POLL_INTERVAL_SECONDS so a /pausa takes effect almost
@@ -149,14 +148,16 @@ POWER_SENTINEL2_MAC = os.environ.get("POWER_SENTINEL2_MAC", "")  # informational
 
 PING_TIMEOUT_SECONDS = int(os.environ.get("PING_TIMEOUT_SECONDS", "2"))
 
-# AI-written alerts (optional). When ANTHROPIC_API_KEY is set, event alerts
+# AI-written alerts (optional). When CLAUDE_API_TOKEN is set, event alerts
 # (power out/back, WAN down/up, router unreachable) are rewritten by Claude
-# in a casual Venezuelan tone. If the key is missing, AI_MESSAGES_ENABLED is
-# false, or the API call fails/times out for any reason, the plain static
-# alert text is sent instead — an alert is never lost or delayed for long
-# because of the AI step. /estado, command replies and startup messages are
-# always static.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip() or None
+# in a casual Venezuelan tone. This service has no Anthropic key of its own:
+# it asks starr-server's claude-api gateway (which reaches Claude through its
+# warp proxy). If the token is missing, AI_MESSAGES_ENABLED is false, or the
+# gateway fails/times out for any reason, the plain static alert text is sent
+# instead — an alert is never lost or delayed for long because of the AI step.
+# /estado, command replies and startup messages are always static.
+CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://host.docker.internal:8787").rstrip("/")
+CLAUDE_API_TOKEN = os.environ.get("CLAUDE_API_TOKEN", "").strip() or None
 AI_MESSAGES_ENABLED = os.environ.get("AI_MESSAGES_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 AI_MODEL = os.environ.get("AI_MODEL", "claude-opus-5-5")
 AI_EFFORT = os.environ.get("AI_EFFORT", "low")
@@ -382,7 +383,7 @@ def ping_host(ip: str, timeout_seconds: int = PING_TIMEOUT_SECONDS) -> bool:
 
 
 # --------------------------------------------------------------------------
-# AI-written alerts (Anthropic API)
+# AI-written alerts (via starr-server's claude-api gateway)
 # --------------------------------------------------------------------------
 
 AI_SYSTEM_PROMPT = """Eres la voz de un bot de Telegram que avisa a una familia venezolana sobre \
@@ -404,21 +405,10 @@ puedes mencionarlo.
 - Responde únicamente con el texto del aviso."""
 
 _recent_ai_messages: deque = deque(maxlen=4)
-_ai_client: Optional[anthropic.Anthropic] = None
-
-
-def _get_ai_client() -> anthropic.Anthropic:
-    global _ai_client
-    if _ai_client is None:
-        # max_retries=0: the main loop is single-threaded, so a slow API must
-        # never stall command polling and router/power checks (and a power
-        # cut can take the internet down too) — fall back to static text.
-        _ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=AI_TIMEOUT_SECONDS, max_retries=0)
-    return _ai_client
 
 
 def ai_enabled() -> bool:
-    return bool(ANTHROPIC_API_KEY) and AI_MESSAGES_ENABLED
+    return bool(CLAUDE_API_TOKEN) and AI_MESSAGES_ENABLED
 
 
 def compose_alert(kind: str, facts: dict, fallback: str) -> str:
@@ -442,29 +432,42 @@ def compose_alert(kind: str, facts: dict, fallback: str) -> str:
     if _recent_ai_messages:
         user_prompt += "\n\nAvisos anteriores (no repetir):\n" + "\n".join(f"- {m}" for m in _recent_ai_messages)
 
+    # The main loop is single-threaded, so a slow gateway must never stall
+    # command polling and router/power checks (and a power cut can take the
+    # internet down too): one try with a short timeout, then static text. The
+    # gateway gets a slightly shorter timeout so it answers 504 cleanly first.
     try:
-        response = _get_ai_client().messages.create(
-            model=AI_MODEL,
-            max_tokens=AI_MAX_TOKENS,
-            system=AI_SYSTEM_PROMPT,
-            output_config={"effort": AI_EFFORT},
-            messages=[{"role": "user", "content": user_prompt}],
+        resp = requests.post(
+            f"{CLAUDE_API_URL}/ask",
+            headers={"Authorization": f"Bearer {CLAUDE_API_TOKEN}", "X-Caller": "wan-monitor"},
+            json={
+                "model": AI_MODEL,
+                "effort": AI_EFFORT,
+                "max_tokens": AI_MAX_TOKENS,
+                "system": AI_SYSTEM_PROMPT,
+                "prompt": user_prompt,
+                "timeout": max(AI_TIMEOUT_SECONDS - 2, 1),
+            },
+            timeout=AI_TIMEOUT_SECONDS,
         )
-    except anthropic.APIError as exc:  # status, connection and timeout errors
-        log.warning("AI message generation failed (%s): %s — sending static alert", type(exc).__name__, exc)
-        return fallback
+        if resp.status_code != 200:
+            log.warning("claude-api answered %s: %s — sending static alert", resp.status_code, resp.text[:300])
+            return fallback
+        result = resp.json()
     except Exception as exc:  # noqa: BLE001 - an alert must go out no matter what
-        log.warning("AI message generation raised %s: %s — sending static alert", type(exc).__name__, exc)
+        log.warning("claude-api request failed (%s): %s — sending static alert", type(exc).__name__, exc)
         return fallback
 
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
-    if response.stop_reason in ("refusal", "max_tokens") or not text:
-        log.warning("AI message unusable (stop_reason=%s, %d chars) — sending static alert", response.stop_reason, len(text))
+    text = (result.get("text") or "").strip()
+    stop_reason = result.get("stop_reason")
+    if stop_reason in ("refusal", "max_tokens") or not text:
+        log.warning("AI message unusable (stop_reason=%s, %d chars) — sending static alert", stop_reason, len(text))
         return fallback
 
+    usage = result.get("usage") or {}
     log.info(
         "AI alert generated (%s, in=%s out=%s tokens, request_id=%s)",
-        kind, response.usage.input_tokens, response.usage.output_tokens, response._request_id,
+        kind, usage.get("input_tokens"), usage.get("output_tokens"), result.get("request_id"),
     )
     _recent_ai_messages.append(text)
     # Telegram parse_mode is HTML: escape whatever the model produced.
@@ -619,9 +622,12 @@ def main() -> None:
 
     client = ER605Client(BASE_URL, ROUTER_USERNAME, ROUTER_PASSWORD)
     if ai_enabled():
-        log.info("AI-written alerts enabled (model=%s, effort=%s, timeout=%ss)", AI_MODEL, AI_EFFORT, AI_TIMEOUT_SECONDS)
+        log.info(
+            "AI-written alerts enabled via %s (model=%s, effort=%s, timeout=%ss)",
+            CLAUDE_API_URL, AI_MODEL, AI_EFFORT, AI_TIMEOUT_SECONDS,
+        )
     else:
-        log.info("AI-written alerts disabled (static alert text) — set ANTHROPIC_API_KEY to enable")
+        log.info("AI-written alerts disabled (static alert text) — set CLAUDE_API_TOKEN to enable")
 
     last_known: dict[str, str] = {}
     down_since: dict[str, float] = {}  # label -> loop_start when it went "down"
