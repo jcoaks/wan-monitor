@@ -402,7 +402,14 @@ no lo menciones. Si "es_minimo" es true, la duración es "al menos" ese tiempo.
 - Texto plano: sin markdown, sin HTML, sin listas, sin comillas alrededor del mensaje.
 - Los avisos de caída son molestos: empatiza. Los de recuperación: alivio. Si es de madrugada, \
 puedes mencionarlo.
-- Responde únicamente con el texto del aviso."""
+- Tu respuesta se envía tal cual a Telegram. Revisa las reglas antes de escribir, no después: \
+escribe solo el aviso final, una sola vez, en un único párrafo, sin borradores, correcciones, \
+comentarios ni explicaciones."""
+
+# The prompt asks for <240 chars in one paragraph. Anything well past that, or
+# with line breaks, is the model thinking out loud (a draft plus "version
+# corregida", etc.) and must not reach the family's phones.
+AI_MAX_ALERT_CHARS = 400
 
 _recent_ai_messages: deque = deque(maxlen=4)
 
@@ -462,6 +469,10 @@ def compose_alert(kind: str, facts: dict, fallback: str) -> str:
     stop_reason = result.get("stop_reason")
     if stop_reason in ("refusal", "max_tokens") or not text:
         log.warning("AI message unusable (stop_reason=%s, %d chars) — sending static alert", stop_reason, len(text))
+        return fallback
+    if "\n" in text or len(text) > AI_MAX_ALERT_CHARS:
+        log.warning("AI message has the wrong shape (%d chars, multi-line=%s) — sending static alert",
+                    len(text), "\n" in text)
         return fallback
 
     usage = result.get("usage") or {}
