@@ -154,7 +154,8 @@ PING_TIMEOUT_SECONDS = int(os.environ.get("PING_TIMEOUT_SECONDS", "2"))
 # it asks starr-server's claude-api gateway (which reaches Claude through its
 # warp proxy). If the token is missing, AI_MESSAGES_ENABLED is false, or the
 # gateway fails/times out for any reason, the plain static alert text is sent
-# instead — an alert is never lost or delayed for long because of the AI step.
+# instead — an alert is never lost or delayed for long because of the AI step
+# (and Claude is retried afterwards to edit it in, see AI_RETRY_*).
 # /estado, command replies and startup messages are always static.
 CLAUDE_API_URL = os.environ.get("CLAUDE_API_URL", "http://host.docker.internal:8787").rstrip("/")
 CLAUDE_API_TOKEN = os.environ.get("CLAUDE_API_TOKEN", "").strip() or None
@@ -166,6 +167,13 @@ AI_MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "1024"))
 # Append the plain factual alert under the AI text so the info is never
 # buried behind a joke.
 AI_KEEP_FACTUAL_LINE = os.environ.get("AI_KEEP_FACTUAL_LINE", "true").strip().lower() not in ("0", "false", "no", "off")
+# warp (and so Claude) usually drops for a minute or more right when the power
+# or the internet goes, which is exactly when alerts fire. When that happens
+# the static alert goes out at once and Claude is retried every
+# AI_RETRY_INTERVAL_SECONDS for up to AI_RETRY_WINDOW_SECONDS; if it answers,
+# the same Telegram message is edited (edits don't ring the phone again).
+AI_RETRY_WINDOW_SECONDS = float(os.environ.get("AI_RETRY_WINDOW_SECONDS", "300"))
+AI_RETRY_INTERVAL_SECONDS = float(os.environ.get("AI_RETRY_INTERVAL_SECONDS", "30"))
 
 BASE_URL = f"{ROUTER_SCHEME}://{ROUTER_HOST}"
 LOGIN_PATH = "/cgi-bin/luci/;stok=/login?form=login"
@@ -418,31 +426,30 @@ def ai_enabled() -> bool:
     return bool(CLAUDE_API_TOKEN) and AI_MESSAGES_ENABLED
 
 
-def compose_alert(kind: str, facts: dict, fallback: str) -> str:
-    """
-    Returns the Telegram HTML text for an event alert. `fallback` is the
-    plain static alert (already HTML-safe); it is returned as-is whenever the
-    AI is disabled or anything goes wrong, and otherwise appended under the
-    AI text when AI_KEEP_FACTUAL_LINE is set.
-    """
-    if not ai_enabled():
-        return fallback
-
-    now = datetime.now()
+def build_ai_prompt(kind: str, facts: dict, when: datetime) -> str:
+    """`when` is the time of the event, so a late retry still talks about it."""
     event = {
         "evento": kind,
-        "hora_local": now.strftime("%H:%M"),
-        "dia_semana": ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"][now.weekday()],
+        "hora_local": when.strftime("%H:%M"),
+        "dia_semana": ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"][when.weekday()],
         **facts,
     }
     user_prompt = "Evento:\n" + json.dumps(event, ensure_ascii=False, indent=2)
     if _recent_ai_messages:
         user_prompt += "\n\nAvisos anteriores (no repetir):\n" + "\n".join(f"- {m}" for m in _recent_ai_messages)
+    return user_prompt
 
+
+def request_ai_text(kind: str, user_prompt: str) -> tuple[Optional[str], bool]:
+    """
+    Asks claude-api for the alert text. Returns (text, retryable): text is
+    None on any failure, and retryable says whether trying again later makes
+    sense (gateway/warp/network trouble) or not (Claude answered something
+    unusable).
+    """
     # The main loop is single-threaded, so a slow gateway must never stall
-    # command polling and router/power checks (and a power cut can take the
-    # internet down too): one try with a short timeout, then static text. The
-    # gateway gets a slightly shorter timeout so it answers 504 cleanly first.
+    # command polling and router/power checks: one try with a short timeout.
+    # The gateway gets a slightly shorter timeout so it answers 504 cleanly first.
     try:
         resp = requests.post(
             f"{CLAUDE_API_URL}/ask",
@@ -458,22 +465,22 @@ def compose_alert(kind: str, facts: dict, fallback: str) -> str:
             timeout=AI_TIMEOUT_SECONDS,
         )
         if resp.status_code != 200:
-            log.warning("claude-api answered %s: %s — sending static alert", resp.status_code, resp.text[:300])
-            return fallback
+            log.warning("claude-api answered %s: %s", resp.status_code, resp.text[:300])
+            # 400/401 won't fix themselves; 502/504 (warp down, timeouts) might.
+            return None, resp.status_code >= 500
         result = resp.json()
     except Exception as exc:  # noqa: BLE001 - an alert must go out no matter what
-        log.warning("claude-api request failed (%s): %s — sending static alert", type(exc).__name__, exc)
-        return fallback
+        log.warning("claude-api request failed (%s): %s", type(exc).__name__, exc)
+        return None, True
 
     text = (result.get("text") or "").strip()
     stop_reason = result.get("stop_reason")
     if stop_reason in ("refusal", "max_tokens") or not text:
-        log.warning("AI message unusable (stop_reason=%s, %d chars) — sending static alert", stop_reason, len(text))
-        return fallback
+        log.warning("AI message unusable (stop_reason=%s, %d chars)", stop_reason, len(text))
+        return None, False
     if "\n" in text or len(text) > AI_MAX_ALERT_CHARS:
-        log.warning("AI message has the wrong shape (%d chars, multi-line=%s) — sending static alert",
-                    len(text), "\n" in text)
-        return fallback
+        log.warning("AI message has the wrong shape (%d chars, multi-line=%s)", len(text), "\n" in text)
+        return None, False
 
     usage = result.get("usage") or {}
     log.info(
@@ -481,18 +488,94 @@ def compose_alert(kind: str, facts: dict, fallback: str) -> str:
         kind, usage.get("input_tokens"), usage.get("output_tokens"), result.get("request_id"),
     )
     _recent_ai_messages.append(text)
+    return text, False
+
+
+def ai_alert_html(text: str, fallback: str) -> str:
     # Telegram parse_mode is HTML: escape whatever the model produced.
     body = html.escape(text)
     return f"{body}\n\n{fallback}" if AI_KEEP_FACTUAL_LINE else body
+
+
+@dataclass
+class PendingAIAlert:
+    kind: str
+    facts: dict
+    fallback: str
+    when: datetime
+    message_id: int
+    give_up_at: float
+    next_try_at: float
+
+
+# Only the latest alert is retried: once a newer one goes out, rewriting an
+# older message would only add stale noise ("a esperar que vuelva" when the
+# power is already back).
+_pending_ai_alert: Optional[PendingAIAlert] = None
+
+
+def send_alert(kind: str, facts: dict, fallback: str, silent: bool) -> None:
+    """
+    Sends an event alert. `fallback` is the plain static alert (already
+    HTML-safe). With AI enabled, Claude's text goes on top; if claude-api
+    can't be reached, the static alert is sent right away and Claude is
+    retried in the background (see retry_pending_ai_alert).
+    """
+    global _pending_ai_alert
+    _pending_ai_alert = None
+    if not ai_enabled():
+        send_telegram_message(fallback, silent=silent)
+        return
+
+    when = datetime.now()
+    text, retryable = request_ai_text(kind, build_ai_prompt(kind, facts, when))
+    if text:
+        send_telegram_message(ai_alert_html(text, fallback), silent=silent)
+        return
+
+    message_id = send_telegram_message(fallback, silent=silent)
+    if retryable and message_id is not None and AI_RETRY_WINDOW_SECONDS > 0:
+        now = time.time()
+        _pending_ai_alert = PendingAIAlert(
+            kind, facts, fallback, when, message_id,
+            give_up_at=now + AI_RETRY_WINDOW_SECONDS,
+            next_try_at=now + AI_RETRY_INTERVAL_SECONDS,
+        )
+        log.info("Static %s alert sent; retrying Claude for up to %ss to edit it", kind, int(AI_RETRY_WINDOW_SECONDS))
+    else:
+        log.info("Static %s alert sent", kind)
+
+
+def retry_pending_ai_alert() -> None:
+    """Called every loop: one retry when due, then edit the message or give up."""
+    global _pending_ai_alert
+    pending = _pending_ai_alert
+    if pending is None or time.time() < pending.next_try_at:
+        return
+
+    text, retryable = request_ai_text(pending.kind, build_ai_prompt(pending.kind, pending.facts, pending.when))
+    if text:
+        _pending_ai_alert = None
+        edit_telegram_message(pending.message_id, ai_alert_html(text, pending.fallback))
+        log.info("Edited %s alert with Claude's text", pending.kind)
+        return
+
+    now = time.time()
+    if not retryable or now + AI_RETRY_INTERVAL_SECONDS > pending.give_up_at:
+        _pending_ai_alert = None
+        log.info("Giving up on Claude for the %s alert; the static text stays", pending.kind)
+    else:
+        pending.next_try_at = now + AI_RETRY_INTERVAL_SECONDS
 
 
 # --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
 
-def send_telegram_message(text: str, silent: bool = True) -> None:
+def send_telegram_message(text: str, silent: bool = True) -> Optional[int]:
     """Silent by default (no sound/vibration on the phone): WAN/router alerts,
-    command replies and status messages. Only power alerts pass silent=False."""
+    command replies and status messages. Only power alerts pass silent=False.
+    Returns the sent message's id, or None if it failed."""
     url = f"{TELEGRAM_API_BASE}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if silent:
@@ -505,8 +588,25 @@ def send_telegram_message(text: str, silent: bool = True) -> None:
         )
         if resp.status_code != 200:
             log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
-    except requests.RequestException as exc:
+            return None
+        return resp.json().get("result", {}).get("message_id")
+    except (requests.RequestException, ValueError) as exc:
         log.error("Telegram send raised an exception: %s", exc)
+        return None
+
+
+def edit_telegram_message(message_id: int, text: str) -> None:
+    """Replaces a sent message's text. Telegram doesn't notify for edits."""
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_API_BASE}/editMessageText",
+            data={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            log.error("Telegram edit failed: %s %s", resp.status_code, resp.text)
+    except requests.RequestException as exc:
+        log.error("Telegram edit raised an exception: %s", exc)
 
 
 def get_telegram_updates(offset: Optional[int]) -> list[dict]:
@@ -738,6 +838,7 @@ def main() -> None:
             power_outages_today = 0
 
         telegram_offset, paused_until = process_telegram_commands(telegram_offset, paused_until, build_status)
+        retry_pending_ai_alert()
 
         if paused_until and loop_start >= paused_until:
             paused_until = None
@@ -767,7 +868,7 @@ def main() -> None:
                     else:
                         static = "✅ El router vuelve a responder. Reanudando monitoreo de WAN."
                         facts = {"que_paso": "el monitor volvió a tener contacto con el router"}
-                    send_telegram_message(compose_alert("router_recuperado", facts, static), silent=True)
+                    send_alert("router_recuperado", facts, static, silent=True)
                     unreachable_alert_sent = False
                 first_failure_at = None
 
@@ -816,7 +917,7 @@ def main() -> None:
                         "conexiones_caidas_ahora": others_down,
                         "nota": "son 3 salidas de internet de la casa (proveedores distintos); que una caiga no significa que se quedaron sin internet si otras siguen activas",
                     }
-                    send_telegram_message(compose_alert("cambio_wan", facts, "\n".join(lines)), silent=True)
+                    send_alert("cambio_wan", facts, "\n".join(lines), silent=True)
                     for label, previous, state in changes:
                         log.info("%s: %s -> %s", label, previous, state)
 
@@ -842,7 +943,7 @@ def main() -> None:
                     "segundos_sin_contacto": UNREACHABLE_ALERT_AFTER * POLL_INTERVAL_SECONDS,
                     "posibles_causas": "el router, la red local o el propio monitor (no se sabe cuál)",
                 }
-                send_telegram_message(compose_alert("router_sin_contacto", facts, static), silent=True)
+                send_alert("router_sin_contacto", facts, static, silent=True)
                 unreachable_alert_sent = True
 
         # Power-outage sentinel: on its own schedule, independent of both the
@@ -889,7 +990,7 @@ def main() -> None:
                         facts["tiempo_con_luz_antes_del_corte"] = format_duration(loop_start - power_up_since)
                         facts["es_minimo"] = power_up_since_is_lower_bound
                     static = f"🔌 Se fue la luz ({who} dejaron de responder)"
-                    send_telegram_message(compose_alert("se_fue_la_luz", facts, static), silent=False)
+                    send_alert("se_fue_la_luz", facts, static, silent=False)
                     power_down_since = loop_start
                     power_up_since = None
                 else:
@@ -904,7 +1005,7 @@ def main() -> None:
                         static = f"💡 Volvió la luz ({which_back} responde de nuevo, estuvo sin luz {down_for})"
                     else:
                         static = f"💡 Volvió la luz ({which_back} responde de nuevo)"
-                    send_telegram_message(compose_alert("volvio_la_luz", facts, static), silent=False)
+                    send_alert("volvio_la_luz", facts, static, silent=False)
                     power_down_since = None
                     power_up_since = loop_start
                     power_up_since_is_lower_bound = False
