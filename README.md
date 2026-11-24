@@ -132,6 +132,13 @@ el proxy `warp`. `CLAUDE_API_TOKEN` tiene que ser el mismo valor que en el
 - Si no hay token, `AI_MESSAGES_ENABLED=false`, `claude-api` no responde o
   pasa `AI_TIMEOUT_SECONDS` (12s), se manda el aviso estático de siempre:
   nunca se pierde una alerta por culpa de la IA.
+- warp suele caerse un minuto o más justo cuando se va la luz o el internet.
+  Si `claude-api` falla por eso (502/504 o sin conexión), el aviso estático
+  sale al instante y se reintenta Claude cada `AI_RETRY_INTERVAL_SECONDS`
+  (30s) durante `AI_RETRY_WINDOW_SECONDS` (300s). Si responde, se **edita**
+  ese mismo mensaje con su texto (editar no vuelve a sonar en el teléfono).
+  Solo se reintenta el último aviso: si sale uno nuevo, el anterior se queda
+  estático.
 - `/estado`, las respuestas a comandos y los mensajes de inicio siguen
   estáticos. El sonido/silencio de cada aviso no cambia.
 - `AI_MODEL` (default `claude-opus-5-5`) y `AI_EFFORT` (default `low`) se
